@@ -29,9 +29,11 @@ jobs:
 
       - name: Run screener
         env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT:  ${{ secrets.TG_CHAT }}
+          TG_TOKEN:      ${{ secrets.TG_TOKEN }}
+          TG_CHAT:       ${{ secrets.TG_CHAT }}
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
         run: python scan.py
+
 
       - name: Commit CSV back to repo
         if: ${{ success() }}
