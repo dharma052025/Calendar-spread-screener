@@ -1,19 +1,18 @@
-# screener.py
-import numpy as np, yfinance as yf
-from datetime import datetime, timedelta
+# screener.py – pulls option IV from Tradier, price/history from yfinance
+import os, datetime, requests, numpy as np, pandas as pd, yfinance as yf
 from scipy.interpolate import interp1d
 
-# ---------- helpers --------------------------------------------------
-def filter_dates(dates):
-    today  = datetime.utcnow().date()
-    cutoff = today + timedelta(days=45)
-    keep   = sorted(
-        d for d in (datetime.strptime(x, "%Y-%m-%d").date() for x in dates)
-        if d >= cutoff
-    )
-    return [d.strftime("%Y-%m-%d") for d in keep[:1]]  # nearest ≥45-d expiry
+TRADIER_TOKEN = os.getenv("TRADIER_TOKEN")
+HEADERS = {
+    "Authorization": f"Bearer {TRADIER_TOKEN}",
+    "Accept": "application/json"
+}
+BASE = "https://sandbox.tradier.com/v1"
 
+# ─── realised-vol (unchanged) ─────────────────────────────────────────
 def yang_zhang(df, window=30, periods=252):
+    if len(df) < window + 1:
+        return np.nan
     log_ho = np.log(df.High  / df.Open)
     log_lo = np.log(df.Low   / df.Open)
     log_co = np.log(df.Close / df.Open)
@@ -29,49 +28,73 @@ def yang_zhang(df, window=30, periods=252):
     sigma = np.sqrt(ov + k*cv + (1-k)*rv)*np.sqrt(periods)
     return sigma.iloc[-1]
 
-def term_curve(days, ivs):
-    i = np.argsort(days)
-    return interp1d(np.asarray(days)[i], np.asarray(ivs)[i],
-                    kind="linear", fill_value="extrapolate")
+# ─── Tradier helpers ──────────────────────────────────────────────────
+def expirations(symbol):
+    url = f"{BASE}/markets/options/expirations"
+    r = requests.get(url, headers=HEADERS,
+                     params={"symbol": symbol, "includeAllRoots": "true"})
+    if r.status_code != 200 or "expirations" not in r.json():
+        return []
+    return r.json()["expirations"]["date"]       # list of YYYY-MM-DD
 
-# ---------- main scoring function -----------------------------------
-def score_ticker(sym: str):
-    tk = yf.Ticker(sym)
-    if not tk.options:
-        return None                     # skip symbols w/o options
+def atm_mid_iv(symbol, expiry, spot):
+    """Return ATM mid-IV for <symbol, expiry> or None."""
+    url = f"{BASE}/markets/options/chains"
+    r = requests.get(url, headers=HEADERS,
+                     params={"symbol": symbol, "expiration": expiry,
+                             "greeks": "true"})
+    if r.status_code != 200 or "options" not in r.json():
+        return None
+    df = pd.json_normalize(r.json()["options"]["option"])
+    if df.empty:
+        return None
+    # choose strike closest to spot
+    row = df.iloc[(df.strike - spot).abs().idxmin()]
+    iv  = row["greeks.mid_iv"]
+    return iv if iv else None
 
-    # ---- build ATM IV term structure ----
-    atm_ivs, dtes = [], []
-    today = datetime.utcnow().date()
-    for exp in filter_dates(tk.options):
-        chain = tk.option_chain(exp)
-        if chain.calls.empty or chain.puts.empty:
+def term_structure(symbol, spot, dte_min=45):
+    today = datetime.date.today()
+    dtes, ivs = [], []
+    for exp in expirations(symbol):
+        exp_date = datetime.datetime.strptime(exp, "%Y-%m-%d").date()
+        dte = (exp_date - today).days
+        if dte < dte_min:
             continue
-        price = tk.history(period="1d").Close.iloc[-1]
-        calls, puts = chain.calls, chain.puts
-        atm_call = calls.iloc[(calls.strike-price).abs().idxmin()]
-        atm_put  =  puts.iloc[(puts.strike -price).abs().idxmin()]
-        atm_iv   = (atm_call.impliedVolatility + atm_put.impliedVolatility)/2
-        atm_ivs.append(atm_iv)
-        dtes.append((datetime.strptime(exp, "%Y-%m-%d").date() - today).days)
+        iv = atm_mid_iv(symbol, exp, spot)
+        if iv is not None:
+            dtes.append(dte)
+            ivs .append(iv)
+    return dtes, ivs
 
-    if not atm_ivs:
+# ─── main scoring function ───────────────────────────────────────────
+def score_ticker(sym: str):
+    # spot price & historical bars from yfinance
+    yf_tkr  = yf.Ticker(sym)
+    price   = yf_tkr.history(period="1d").Close.iloc[-1]
+
+    dtes, ivs = term_structure(sym, price)
+    if len(ivs) < 2:
         return None
 
-    curve     = term_curve(dtes, atm_ivs)
+    curve     = interp1d(dtes, ivs, kind="linear", fill_value="extrapolate")
     ts_slope  = (curve(45) - curve(dtes[0])) / (45 - dtes[0])
     iv30      = curve(30)
 
-    hist      = tk.history(period="3mo")
+    hist      = yf_tkr.history(period="4mo").dropna()
     rv30      = yang_zhang(hist)
+    if np.isnan(rv30) or rv30 == 0:
+        return None
+
     avg_vol   = hist.Volume.rolling(30).mean().iloc[-1]
 
     return dict(
-        avg_volume     = avg_vol,
-        iv30_rv30      = iv30/rv30,
-        ts_slope_0_45  = ts_slope,
+        avg_volume    = avg_vol,
+        iv30_rv30     = iv30 / rv30,
+        ts_slope_0_45 = ts_slope,
     )
 
+# ─── pass/fail rule (unchanged) ───────────────────────────────────────
 def passes(m):
     return (
         m["avg_volume"]    >= 1_500_000 and
