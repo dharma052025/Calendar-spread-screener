@@ -1,34 +1,34 @@
-# .github/workflows/calendar_scan.yml
 name: Calendar-Spread Scan
 
 on:
+  # Nightly at 8 PM US-Eastern  ➜  00:00 UTC (during EDT)
   schedule:
-    # 8 PM America/New_York = 00:00 UTC during EDT
     - cron: '0 0 * * *'
+  # Manual “Run workflow” button
   workflow_dispatch:
-push:
-    paths-ignore:
-      - 'list*.csv'
 
 jobs:
   scan:
-    permissions: { contents: write }     # allow git push with GITHUB_TOKEN
+    permissions:
+      contents: write         # allow the bot to push the CSV
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+        with:
+          python-version: '3.11'
 
-      - name: Cache pip
+      - name: Cache pip packages
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Run screener
         env:
@@ -37,12 +37,14 @@ jobs:
           TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
         run: python scan.py
 
-
       - name: Commit CSV back to repo
         if: ${{ success() }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add list*.csv
-          git commit -m "Add results for $(date +%F)" || echo "nothing to commit"
+          # The [skip ci] tag prevents this push from triggering any workflows
+          git commit -m "data: add results $(date +%F) [skip ci]" \
+            || echo "nothing to commit"
           git push origin HEAD:${{ github.ref }}
+
