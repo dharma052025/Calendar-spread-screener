@@ -4,3 +4,4 @@ scipy>=1.15
 yfinance>=0.2.54
 requests>=2.32
 python-dateutil>=2.9     # pulled in by pandas/yfinance but explicit for clarity
+py_vollib>=1.0.1
